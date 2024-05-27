@@ -1,0 +1,268 @@
+---
+title: "Deannevr.Assignment04"
+author: 'Deannevr'
+date: "20/04/2024"
+output: html_document
+---
+
+Data source:
+
+- https://github.com/rfordatascience/tidytuesday/tree/master/data/2022/2022-01-18
+
+- https://flavorsofcacao.com/chocolate_database.html
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(dplyr)
+library(tidyr)
+
+library(ggplot2)
+library(reshape2)
+
+library(countrycode) # https://stackoverflow.com/questions/47510141/get-continent-name-from-country-name-in-r
+
+library(car)
+```
+
+# Reading the data
+
+```{r}
+raw_data = read.csv('C:/Users/Deanne/Desktop/Term 4/SUBJECTS/STATS PROGRAMMING/chocolate.csv')
+N = nrow(raw_data)
+raw_data = raw_data %>% mutate(key = 1:N) # adding a unique ID to all rows
+```
+
+# EDA
+
+```{r}
+head(raw_data)
+
+summary(raw_data)
+```
+
+The built-in summary for R gives only a glimpse on the data, showing data types and some fundamental statistics for numerical values. Seeing only the first 5 rows of the data set
+
+```{r}
+tmp = raw_data %>%
+  count(company_location) %>%
+  arrange(desc(n)) %>%
+  top_n(20)
+
+tmp = raw_data %>% inner_join(tmp, by = join_by(company_location)) %>% select(!n)
+
+tmp %>% ggplot(aes(x=reorder(company_location, company_location, length))) + 
+  geom_bar() +
+  coord_flip() +
+  labs(title="Number of chocolate ratings by company locations, in descending order", x = "Company locations", y = "N")
+
+length(unique(raw_data$company_location))
+```
+
+Can see that the chocolate market represented in the data set are largely dominated by the U.S. Keep in mind, that it only displayed the top 20 values for chart clarity, however, this is less than half of the unique values from the data set for company locations.
+
+```{r}
+tmp = raw_data %>%
+  count(country_of_bean_origin) %>%
+  arrange(desc(n)) %>%
+  top_n(20)
+
+tmp = raw_data %>% inner_join(tmp, by = join_by(country_of_bean_origin)) %>% select(!n)
+
+tmp %>% ggplot(aes(x=reorder(country_of_bean_origin, country_of_bean_origin, length))) +
+  geom_bar() +
+  coord_flip() +
+  labs(title="Number of chocolate ratings by cocoa bean origin, in descending order", x = "Bean origin country", y = "N")
+
+length(unique(raw_data$country_of_bean_origin))
+
+nrow(tmp) / nrow(raw_data)
+```
+
+While this data shows less of a drastic drop from a specific value compared to the previous plot with company location, can also see that these top 20 origins of cocoa beans populate 85% of the data set, which also means an uneven distribution.
+
+# Data cleaning and feature engineering
+
+Both data cleaning and feature engineering are core parts of any data science project. Here, the data set mostly contains a set of nominal type variables like manufacturer name, or chocolate characteristics. Nominal variables can be one-hot encoded to map them to numerical values without introducing any kind of ordering between the values variable. One must be careful, however, with one-hot encoding as if the number of unique values is high, it can introduce a vast amount of dummy variables. To address this, an aggregation is done on many of these variables:
+
+- both manufacturer country and cocoa bean origin are first aggregated up to continent level, using the "countrycode" library. This leaves at most 5 different values, which are one-hot encoded in to dummy variables, all starting with either with prefix "company_" referring to the chocolate manufacturer or "origin_" where the beans were grown.
+
+```{r}
+data = raw_data %>%
+  
+  # select only relevant columns: dropping ref and manufacturer, adding key as unique identifier
+  select(key,
+         review_date,
+         company_location,
+         country_of_bean_origin,
+         cocoa_percent,
+         ingredients,
+         most_memorable_characteristics,
+         rating) %>%
+  
+  # renaming
+  rename(year = review_date,
+         location = company_location,
+         origin = country_of_bean_origin,
+         cocoa = cocoa_percent,
+         characteristics = most_memorable_characteristics) %>%
+  
+  # cocoa % to integers
+  mutate(cocoa = as.numeric(sub("%", "", cocoa))) %>% 
+  
+ 
+  # aggregating manufacturer country to continent level
+  mutate(location = countrycode(location, origin = "country.name", destination = "continent")) %>%
+  mutate(location = replace_na(location, "Europe")) %>% # handling some missed data Amsterdam, Scotland, Wales
+  mutate(value = 1) %>% spread(location, value,  fill = 0) %>%
+  rename(company_Africa = Africa,
+         company_Americas = Americas,
+         company_Asia = Asia,
+         company_Europe = Europe,
+         company_Oceania = Oceania) %>%
+  
+  # repeat the same aggregation on cocoa bean origin
+  mutate(continent = countrycode(origin, origin = "country.name", destination = "continent"))  %>%
+  mutate(continent = if_else(origin == "Principe", "Africa", continent)) %>%
+  mutate(continent = if_else(origin == "Sulawesi", "Oceania", continent)) %>%
+  mutate(continent = if_else(origin == "Sumatra", "Oceania", continent)) %>%
+  filter(origin != "Blend") %>%
+  select(!origin) %>%
+  mutate(value = 1) %>% spread(continent, value,  fill = 0) %>%
+  rename(origin_Africa = Africa,
+         origin_Americas = Americas,
+         origin_Asia = Asia,
+         # origin_Europe = Europe, # Europe is not in the manufacturers
+         origin_Oceania = Oceania)
+
+head(data)
+```
+
+To utilize a characteristics column, sentiment analysis was exploited from the "tidytext" library. This way can have scoring to critiques written assessment. For a given chocolate, these ratings were averaged back to get a single score. Also, the number of characteristics given were also saved in a column.
+
+```{r}
+library(tidytext)
+
+# temporary data table, adding count of characteristics to entries
+tmp = data %>%
+  select(key, characteristics) %>%
+  separate_longer_delim(characteristics, ", ") %>%
+  left_join(get_sentiments("afinn"), join_by(characteristics == word)) %>% rename(sentiment = value) %>% mutate(sentiment = replace_na(sentiment, 0)) %>%
+  group_by(key) %>% summarise(count_characteristics = n(), average_characteristics_rating = round(mean(sentiment), 4))
+
+data = data %>% inner_join(tmp) %>% select(!characteristics)
+
+head(tmp)
+```
+
+Lastly, similar transformation is done on the additional ingredients columns. Each ingredient were extracted into separate, binary columns, which have value 1 if the given ingredient is added to the chocolate. The total number of additional ingredients were also saved.
+
+```{r}
+library(stringr)
+
+tmp = data %>%
+  select(key, ingredients) %>%
+  mutate(ingredients = str_replace_all(ingredients, "\\d-", "")) %>%
+  separate_longer_delim(ingredients, ",") %>%
+  mutate(ingredients = str_replace_all(ingredients, " B", "B")) %>%
+  mutate(value = 1) %>% spread(ingredients, value,  fill = 0) %>%
+  select(!V1) %>%
+  rename(
+    contains_beans = B,
+    contains_cocoa_butter = C,
+    contains_lecithin = L,
+    contains_sugar = S,
+    contains_sweetener = "S*",
+    contains_salt = Sa,
+    contains_vanilla = V) %>%
+  mutate(count_additional_ingredients = contains_beans + contains_cocoa_butter + contains_lecithin + contains_sugar + contains_sweetener + contains_salt + contains_vanilla)
+
+data = data %>% inner_join(tmp, join_by(key)) %>% select(!ingredients)
+
+head(tmp)
+```
+
+# Additional data inspection after transformation
+
+This short section will present a few additional interesting details about the data set.
+
+```{r}
+tmp = data %>% group_by(year) %>% summarise(avg = mean(rating))
+
+tmp %>%
+  ggplot(aes(x = year, y = avg)) +
+  geom_line(size = 1) +
+  labs(title="Average rating of chocolate over years", x = "", y = "")
+
+round(cor(data$year, data$rating), 2)
+
+round(cor(tmp$year, tmp$avg), 2)
+
+data %>%
+  summarise_at(c("company_Africa", "company_Americas", "company_Asia", "company_Europe", "company_Oceania"), sum) %>%
+  gather() %>% 
+  ggplot(aes(x=key, y=value)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title="Number of chocolate ratings by company locations on continent level", x = "Company locations continents", y = "N")
+
+data %>%
+  summarise_at(c("origin_Africa", "origin_Americas", "origin_Asia", "origin_Oceania"), sum) %>%
+  gather() %>%
+  ggplot(aes(x=key, y=value)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title="Number of chocolate ratings by cocoa bean origin continent", x = "Bean origin country continents", y = "N")
+```
+
+Notes:
+
+1. While the low correlation between year and rating suggest no linear relationship between in the data set, the aggregation to year level indicates a more strong relationship. Judges seem to rate chocolates higher over time.
+
+2. While the aggregation did not solve the skewness of our data towards America, its variance in terms of distinct values is certainly reduced. This will lead to a model which more easy to interpret.
+
+After all this, can conclude the section with centering and scaling the data.
+
+```{r}
+data = data %>% select(!key) %>% scale() %>% data.frame()
+# summary(data)
+```
+
+# A linear model fitted and evaluated
+
+```{r}
+model = lm(rating ~ year + cocoa +
+            company_Africa + company_Americas + company_Asia + company_Europe + company_Oceania +
+            origin_Africa + origin_Americas + origin_Asia + origin_Oceania +
+            count_characteristics + average_characteristics_rating +
+            contains_beans + contains_cocoa_butter + contains_lecithin + contains_sugar + contains_sweetener + contains_salt + contains_vanilla + count_additional_ingredients,
+          data)
+
+summary(model)
+
+round(anova(model), 4)
+
+corr = melt(round(cor(data), 2)) 
+ggplot(data = corr, aes(x=Var1, y=Var2, fill=value)) + 
+  geom_tile() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)) +
+  labs(title="Correlation between data set variables", x = "", y = "")
+
+hist(resid(model))
+
+shapiro.test(resid(model))
+
+car::ncvTest(model)
+```
+
+In the end, tried to fit a linear model to the data set, trying to see if there are variables whose linear combination explain certain ratings. The model reported the following with varying significance:
+
+- year
+- cocoa
+- count_characteristics
+- contains_beans
+- contains_vanilla
+
+These variables were also reported as significant in the ANOVA, meaning that they indeed explain a proportion of variance among the ratings.
+
+However, in the end the model residuals' statistics indicates that fitting a linear model is not appropriate to this set of variables because 1) the residuals are not normally distributed - which is visible on the histogram and Shapiro-Wilk test returned a p-value below of the usual 0.05 tolerance; and because 2) the residuals are also not homoscedastic, proven by the Breusch–Pagan test which returned also a low p-value.
